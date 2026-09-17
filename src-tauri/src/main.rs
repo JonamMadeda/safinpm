@@ -64,13 +64,32 @@ struct CachedScan {
     projects: Vec<ProjectInfo>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct Store {
     ignored_paths: Vec<String>,
     last_folder: Option<String>,
     last_scan: Option<CachedScan>,
     total_freed_bytes: u64,
+    /// "auto" (download + install silently, the default) or "ask".
+    #[serde(default = "default_update_mode")]
+    update_mode: String,
+}
+
+fn default_update_mode() -> String {
+    "auto".to_string()
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self {
+            ignored_paths: Vec::new(),
+            last_folder: None,
+            last_scan: None,
+            total_freed_bytes: 0,
+            update_mode: default_update_mode(),
+        }
+    }
 }
 
 /// Set by `cancel_scan`; checked by the running `scan_directory`.
@@ -553,8 +572,7 @@ fn save_scan(app: AppHandle, folder: String, projects: Vec<ProjectInfo>) -> Resu
 
 /// Add `bytes` to the lifetime freed total; returns the new total.
 #[tauri::command]
-fn record_freed(app: AppHandle, bytes: u64) -> Result<u64, String> {
-    let file = store_file(&app)?;
+fn record_freed(app: AppHandle, bytes: u64) -> Result<u64, String> {    let file = store_file(&app)?;
     let mut store = load_store_from(&file);
     store.total_freed_bytes = store.total_freed_bytes.saturating_add(bytes);
     let total = store.total_freed_bytes;
@@ -562,9 +580,24 @@ fn record_freed(app: AppHandle, bytes: u64) -> Result<u64, String> {
     Ok(total)
 }
 
+/// Update behavior: "auto" (default — download + install silently) or "ask".
+#[tauri::command]
+fn set_update_mode(app: AppHandle, mode: String) -> Result<String, String> {
+    if mode != "auto" && mode != "ask" {
+        return Err("update mode must be \"auto\" or \"ask\"".to_string());
+    }
+    let file = store_file(&app)?;
+    let mut store = load_store_from(&file);
+    store.update_mode = mode.clone();
+    save_store_to(&file, &store)?;
+    Ok(mode)
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             scan_directory,
             cancel_scan,
@@ -575,7 +608,8 @@ fn main() {
             get_store,
             set_ignored_paths,
             save_scan,
-            record_freed
+            record_freed,
+            set_update_mode
         ])
         .run(tauri::generate_context!())
         .expect("error while running safinpm");
@@ -703,6 +737,25 @@ mod tests {
         assert_eq!(find_workspace_root(&root, &roots, &scan_root), None);
 
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn update_mode_defaults_to_auto_and_rejects_garbage() {
+        // Fresh store → auto.
+        assert_eq!(Store::default().update_mode, "auto");
+        // Old stores without the field (e.g. from v0.1.0) → auto via serde default.
+        let legacy: Store = serde_json::from_str(
+            r#"{"ignoredPaths":[],"lastFolder":null,"lastScan":null,"totalFreedBytes":0}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.update_mode, "auto");
+        // Roundtrip preserves an explicit choice.
+        let file = std::env::temp_dir().join(format!("safinpm-store-{}.json", generate_id()));
+        let mut store = Store::default();
+        store.update_mode = "ask".to_string();
+        save_store_to(&file, &store).unwrap();
+        assert_eq!(load_store_from(&file).update_mode, "ask");
+        std::fs::remove_file(&file).unwrap();
     }
 
     #[test]

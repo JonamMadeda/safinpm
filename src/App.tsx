@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
+import { check, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   ArrowDownUp,
@@ -8,6 +11,7 @@ import {
   CheckCircle2,
   Clock,
   Copy,
+  Download,
   Eye,
   EyeOff,
   FolderOpen,
@@ -65,6 +69,12 @@ interface StoreData {
   lastFolder: string | null;
   lastScan: CachedScan | null;
   totalFreedBytes: number;
+  updateMode?: string; // "auto" | "ask" (absent in pre-0.2.0 stores → auto)
+}
+
+interface AvailableUpdate {
+  version: string;
+  body?: string;
 }
 
 type SortKey = "lastActiveTimestamp" | "sizeBytes" | "projectName";
@@ -135,7 +145,14 @@ export default function App() {
   const [totalFreed, setTotalFreed] = useState(0);
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [inUse, setInUse] = useState<ProcessHit[]>([]);
+  const [appVersion, setAppVersion] = useState("");
+  const [updateMode, setUpdateMode] = useState<"auto" | "ask">("auto");
+  const [availableUpdate, setAvailableUpdate] = useState<AvailableUpdate | null>(null);
+  const [updating, setUpdating] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<number | null>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
   const cancelRequested = useRef(false);
+  const updateModeRef = useRef<"auto" | "ask">("auto");
 
   const sorted = useMemo(() => {
     const arr = [...projects];
@@ -218,6 +235,81 @@ export default function App() {
     setSelected(allSelected ? new Set() : new Set(cleanableVisible.map((p) => p.id)));
   }
 
+  // ---- Auto-update (Tauri updater, GitHub releases feed) ----
+  function setMode(mode: "auto" | "ask") {
+    setUpdateMode(mode);
+    updateModeRef.current = mode;
+  }
+
+  async function downloadAndInstallUpdate(update: Update) {
+    setAvailableUpdate(null);
+    setUpdating(true);
+    setUpdateProgress(0);
+    let downloaded = 0;
+    let total = 0;
+    try {
+      await update.downloadAndInstall((e) => {
+        if (e.event === "Started") {
+          total = e.data.contentLength ?? 0;
+        } else if (e.event === "Progress") {
+          downloaded += e.data.chunkLength;
+          if (total > 0) setUpdateProgress(Math.round((downloaded / total) * 100));
+        }
+      });
+      setUpdateProgress(100);
+      // Windows installers exit the app during install; relaunch into the new version.
+      await relaunch();
+    } catch (err) {
+      setError(`Update failed: ${String(err)}`);
+      setUpdating(false);
+      setUpdateProgress(null);
+    }
+  }
+
+  async function checkForUpdates(manual: boolean) {
+    if (manual) setCheckingUpdate(true);
+    try {
+      const update = await check();
+      if (!update) {
+        if (manual) showToast("You're up to date");
+        return;
+      }
+      if (!manual && updateModeRef.current === "auto") {
+        await downloadAndInstallUpdate(update);
+      } else {
+        setAvailableUpdate({ version: update.version, body: update.body ?? undefined });
+      }
+    } catch (err) {
+      if (manual) setError(`Update check failed: ${String(err)}`);
+    } finally {
+      if (manual) setCheckingUpdate(false);
+    }
+  }
+
+  async function updateNow() {
+    try {
+      const update = await check();
+      if (!update) {
+        setAvailableUpdate(null);
+        showToast("You're up to date");
+        return;
+      }
+      await downloadAndInstallUpdate(update);
+    } catch (err) {
+      setError(`Update failed: ${String(err)}`);
+    }
+  }
+
+  async function toggleUpdateMode() {
+    const next = updateModeRef.current === "auto" ? "ask" : "auto";
+    setMode(next);
+    try {
+      await invoke("set_update_mode", { mode: next });
+    } catch (err) {
+      setError(`Could not save update preference: ${String(err)}`);
+    }
+  }
+
   // ---- Effects: live scan events + persisted store ----
   useEffect(() => {
     let unProgress: (() => void) | undefined;
@@ -237,6 +329,12 @@ export default function App() {
         const s = await invoke<StoreData>("get_store");
         setIgnored(new Set(s.ignoredPaths || []));
         setTotalFreed(s.totalFreedBytes || 0);
+        setMode(s.updateMode === "ask" ? "ask" : "auto");
+        try {
+          setAppVersion(await getVersion());
+        } catch {
+          // Version label is cosmetic.
+        }
         if (s.lastFolder) setLastFolder(s.lastFolder);
         if (s.lastScan) {
           setProjects(s.lastScan.projects);
@@ -244,6 +342,10 @@ export default function App() {
           setCachedAt(s.lastScan.scannedAt);
           setCacheBanner(true);
         }
+        // Silent launch check: auto mode installs, ask mode shows a banner.
+        window.setTimeout(() => {
+          void checkForUpdates(false);
+        }, 2500);
       } catch {
         // First run: no store yet.
       }
@@ -566,6 +668,28 @@ export default function App() {
               className="ml-auto text-cyan-300 hover:text-cyan-100"
             >
               <X className="h-4 w-4" />
+            </button>
+          </div>
+        )}
+
+        {availableUpdate && !updating && (
+          <div className="flex flex-wrap items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-200">
+            <Download className="h-4 w-4 shrink-0" />
+            <span>
+              Update available: <strong>v{availableUpdate.version}</strong>
+              {availableUpdate.body ? ` — ${availableUpdate.body.slice(0, 160)}` : ""}
+            </span>
+            <button
+              onClick={updateNow}
+              className="rounded-lg bg-emerald-600 px-3 py-1 text-xs font-semibold text-white hover:bg-emerald-500"
+            >
+              Update now
+            </button>
+            <button
+              onClick={() => setAvailableUpdate(null)}
+              className="rounded-lg border border-emerald-500/40 px-3 py-1 text-xs text-emerald-200 hover:border-emerald-400"
+            >
+              Later
             </button>
           </div>
         )}
@@ -916,6 +1040,26 @@ export default function App() {
           <code>trash</code> crate — nothing is permanently deleted. Reinstall anytime with{" "}
           <code>npm install</code>.
         </p>
+
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-slate-800 pt-3 text-xs text-slate-500">
+          <span>safinpm v{appVersion || "…"}</span>
+          <button
+            onClick={() => checkForUpdates(true)}
+            disabled={checkingUpdate || updating}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 px-2.5 py-1 text-slate-300 hover:border-slate-500 disabled:opacity-50"
+          >
+            {checkingUpdate ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+            Check for updates
+          </button>
+          <button
+            onClick={toggleUpdateMode}
+            title={updateMode === "auto" ? "Auto-update is ON: updates install silently. Click to ask first." : "Auto-update is OFF: you'll be asked first. Click for silent auto-updates."}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 px-2.5 py-1 text-slate-300 hover:border-slate-500"
+          >
+            <Download className="h-3.5 w-3.5" />
+            Auto-update: {updateMode === "auto" ? "On" : "Off"}
+          </button>
+        </div>
       </main>
 
       {/* Confirm dialog (single + bulk) */}
@@ -995,6 +1139,25 @@ export default function App() {
                 {pendingBulk ? `Yes, recycle ${pendingBulk.length}` : "Yes, recycle it"}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Update progress overlay */}
+      {updating && (
+        <div className="fixed bottom-6 left-1/2 z-30 w-full max-w-sm -translate-x-1/2 px-4">
+          <div className="rounded-xl border border-cyan-500/30 bg-slate-800 px-4 py-3 text-sm shadow-2xl">
+            <div className="flex items-center gap-2">
+              <Loader2 className="h-4 w-4 animate-spin text-cyan-400" />
+              <span>Downloading update… {updateProgress ?? 0}%</span>
+            </div>
+            <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-700">
+              <div
+                className="h-full rounded-full bg-cyan-500 transition-all"
+                style={{ width: `${updateProgress ?? 0}%` }}
+              />
+            </div>
+            <p className="mt-1.5 text-xs text-slate-400">The app will restart automatically.</p>
           </div>
         </div>
       )}
